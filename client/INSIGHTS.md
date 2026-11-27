@@ -44,6 +44,16 @@ actionable cold.
 **Rule:** NEVER set `retry` on an individual hook — because it beats the test client's default and makes error-state tests slow/flaky; change retry policy centrally in `lib/providers.tsx` if needed.
 **Evidence:** `client/src/lib/hooks/skills.ts` → `useSkill()` | test `SkillDetail > shows a load error with retry for other failures`
 
+### 2026-11-26 — A plain-object route in mockFetch cannot fail
+**Insight:** In `app/skills/_components/test-utils.tsx` `mockFetch`, a route given as an object is sent as the BODY with status 200; `{ status: 409, body: … }` therefore "succeeds" and the component receives `{status, body}` as data (here: `name` undefined → crash in `isValidSkillName`).
+**Rule:** ALWAYS give error (and non-200) routes as functions: `"POST /x": () => ({ status: 409, body: {...} })` — because only the function form is read for `status`.
+**Evidence:** `client/src/app/skills/_components/test-utils.tsx` → `mockFetch()` | `CreateSkillFromConventionsModal.test.tsx` "on 409 says the name is taken"
+
+### 2026-11-26 — Invalidating the suggestions list after each link empties the open dialog
+**Insight:** `useLinkAgentSkill` first invalidated `queryKeys.agentSuggestions(skillId)` normally; the active dialog refetched after every successful POST and the server (which excludes already-linked agents) returned a shorter list, so on a partial failure the "Linked" rows vanished. The RTL test missed it because a plain-object `mockFetch` route returns the same list forever.
+**Rule:** ALWAYS invalidate a list that an open dialog iterates with `refetchType: "none"` and mock it as a stateful function that drops linked items like the server — because a normal invalidate refetches active observers at once and a static mock cannot reveal it.
+**Evidence:** `client/src/lib/hooks/agents.ts` → `useLinkAgentSkill()` | test `AgentSuggestionsDialog.test.tsx` "a failed link keeps the dialog…" (fails without `refetchType: "none"`)
+
 ## Codebase Patterns
 
 ### 2026-11-21 — Keep shared src/components free of their own i18n namespace
@@ -80,6 +90,7 @@ actionable cold.
 **Insight:** `lib/providers.tsx` `MutationCache.onError` already toasts every failed mutation; a per-caller `toast.error` shows two toasts.
 **Rule:** ALWAYS rely on the global mutation error toast and only add success toasts locally — because a second error toast duplicates it; use mutation `meta` if a custom message is ever needed.
 **Evidence:** `client/src/lib/providers.tsx` → `MutationCache` | `AgentEditor/_components/SkillsTab/useSkillsTab.ts`
+> **Update 2026-11-27:** a mutation that shows its own error inline (e.g. `useImportSkillUrl`, the 422 reason under the URL field) sets `meta: { inlineError: true }`; `MutationCache.onError` in `lib/providers.tsx` then skips the global toast.
 
 ### 2026-11-26 — Status colour tokens are --ok / --warn / --crit
 **Insight:** Specs say `--success` / `--warning` / `--danger`, but the theme defines none of them; the semantic tokens are `--ok`, `--warn`, `--crit` (+ `-bg` variants). An undefined var renders as inherited colour with no error.
@@ -90,6 +101,21 @@ actionable cold.
 **Insight:** The first Skills implementation reused `ListDetail` (list on the left, detail on the right) because the designs showed it, but the user wanted the same card-grid page as `/agents` and a full-width detail page, and the Versions tab to show per-version Diff against the PREVIOUS version, inline, with Diff on the current row too.
 **Rule:** ALWAYS model a new list page on `AgentsListView` (header + search + Add menu + `repeat(auto-fill, minmax(280px, 1fr))` grid, click → `/<thing>/:id`) unless the user asks for a side list — because the user corrected the layout once already; `ListDetail` stays only for the Agent Editor.
 **Evidence:** `client/src/app/skills/_components/SkillsView/SkillsView.tsx`, `SkillDetailView/SkillDetailView.tsx`, `VersionsTab/_components/VersionRow/VersionRow.tsx`; spec `docs/specs/m2-skills/SPEC.md` §3.5, §5.6
+
+### 2026-11-26 — Merge conflicts travel to the Config tab through a never-fetched query
+**Insight:** Conflicts from `POST /repos/:id/conventions/skill` (merge) are not stored on the server (plan decision F5); `useCreateSkillFromConventions` puts them at `queryKeys.mergeConflicts(skillId)` and `ConfigTab` reads them with `useMergeConflicts()` (`enabled: false`, `staleTime: Infinity`) after the redirect; clearing writes `[]` so the mounted observer re-renders.
+**Rule:** ALWAYS seed that key in tests via `renderWithProviders(ui, qc)` from `app/skills/_components/test-utils` — because the hook never fetches and an empty cache shows no dialog.
+**Evidence:** `client/src/lib/hooks/conventions.ts` → `useMergeConflicts()`, `useClearMergeConflicts()` | test `ConfigTab.test.tsx` "after a merge, the conflicts dialog fills the form on Apply"
+
+### 2026-11-26 — Skill delete and rename must invalidate every conventions page
+**Insight:** The "in <skill>" badges on `/repos/:id/conventions` come from server-resolved `skill_names` cached under `["conventions", repoId]` (staleTime 30 s); `useDeleteSkill` / `useUpdateSkill` invalidated only skill keys, so a deleted or renamed skill kept its badge after navigating back.
+**Rule:** ALWAYS invalidate `queryKeys.conventionsAll()` in a skill mutation that changes a name or removes a skill — because the dependency crosses features (skills → conventions) and no key in the skills hooks mentions it.
+**Evidence:** `client/src/lib/hooks/skills.ts` → `useDeleteSkill()`, `useUpdateSkill()` | `lib/hooks/keys.ts` → `conventionsAll` | test `DeleteSkillDialog.test.tsx` "a delete marks every conventions page stale…"
+
+### 2026-11-26 — A dialog opened by a URL flag must clear the flag when it shows nothing
+**Insight:** `AgentSuggestionsDialog` returned `null` for an empty list or a failed request, so `?suggest=1` stayed and a reload / Back reopened the dialog outside the create flow; its `onClose` is an inline `router.replace` arrow, new on every render.
+**Rule:** ALWAYS call `onClose` once (ref guard + latest-callback ref, effect keyed on the "nothing to show" flag) when a URL-triggered dialog decides not to render, and ignore X / backdrop while its mutation is in flight — because otherwise the flag outlives the flow and a mid-flight close loses the per-row outcomes.
+**Evidence:** `client/src/app/skills/_components/AgentSuggestionsDialog/useAgentSuggestionsDialog.ts` → `nothingToShow`, `dismiss` | tests `AgentSuggestionsDialog.test.tsx` "no agent fits…", "while links are in flight…"
 
 ## Tool & Library Notes
 
@@ -124,6 +150,16 @@ actionable cold.
 **Rule:** ALWAYS phrase XSS acceptance checks as "no element created" for `<Markdown>` — because escaping-as-text would need a change to the shared component.
 **Evidence:** `client/src/app/skills/_components/SkillDetail/_components/PreviewTab/PreviewTab.test.tsx`
 
+### 2026-11-26 — vendor/ui Modal closes only through onClose (backdrop + X), never on Esc
+**Insight:** `Modal` in `@devdigest/ui` wires `onClose` to the backdrop click AND renders the X only when `onClose` is set; it has no Escape handler. Omitting `onClose` therefore makes a dialog closable only by its own footer buttons.
+**Rule:** ALWAYS omit `onClose` for a dialog whose state would be lost on close (e.g. MergeConflictsDialog, conflicts live only in the client cache) — because a stray backdrop click otherwise discards it with no confirmation.
+**Evidence:** `client/src/vendor/ui/kit/Modal.tsx` → `Modal` | test `MergeConflictsDialog.test.tsx` "has no X / backdrop close"
+
+### 2026-11-27 — jsdom has no Blob.text(): read files with FileReader
+**Insight:** `File.text()` works in browsers but is missing in the client's jsdom, so `await file.text()` throws in tests and an import helper silently returns its "readFailed" branch.
+**Rule:** ALWAYS read a picked / dropped file through `FileReader.readAsText` — because it works in browsers and in jsdom, so the same code path is tested.
+**Evidence:** `client/src/app/skills/_components/CreateSkillModal/helpers.ts` → `readAsText()`, `readSkillFile()` | test `helpers.test.ts` "readSkillFile reads a Markdown file"
+
 ## Recurring Errors & Fixes
 
 ### 2026-11-22 — "borderColor … conflicting borderLeftColor" warning in FindingsPanel tests is pre-existing
@@ -141,6 +177,16 @@ actionable cold.
 **Rule:** ALWAYS import `@devdigest/shared` with `import type` in client code and keep enum value lists as local constants (`as const satisfies readonly X[]`) — because a value import compiles in tsc/vitest but crashes the page at runtime.
 **Evidence:** `client/src/vendor/shared/index.ts` → `export * from './contracts/findings.js'`; fix in `client/src/app/skills/_components/constants.ts` → `SKILL_TYPES`
 
+### 2026-11-26 — findByRole("status") returns the empty toast region
+**Insight:** `ToastProvider` renders a `role="status"` live region, so in any test wrapped with it `findByRole("status")` matches the (empty) toast container instead of your own status banner.
+**Rule:** ALWAYS find a status banner by its text and then `.closest("[role=status]")` — because the toast region is always mounted first.
+**Evidence:** `client/src/lib/toast.tsx` → `role="status"` | test `ConventionsView.test.tsx` "a scan that keeps nothing keeps the header…"
+
+### 2026-11-26 — Create-skill mocks without conflicts break the success path
+**Insight:** Since stage 2, `useCreateSkillFromConventions` onSuccess reads `conflicts.length`; a mock body `{ skill }` (the stage-1 shape) throws inside onSuccess, so `router.push` is never called and the test fails on navigation, not on the data.
+**Rule:** ALWAYS mock `ConventionSkillResult` in full: `{ skill, added, duplicates, conflicts: [] }` — because the contract fields are required and the hook trusts them.
+**Evidence:** `CreateSkillFromConventionsModal.test.tsx` "prefills from the draft…" | `client/src/lib/hooks/conventions.ts` → `useCreateSkillFromConventions()`
+
 ## Session Notes
 
 - 2026-11-21 — M1 run cost (client: RunCostBadge in PR list, timeline, trace drawer, verdict banner): done, 68 tests green; see "Keep shared src/components free of their own i18n namespace"
@@ -150,6 +196,14 @@ actionable cold.
 - 2026-11-25 — Researched React/Next.js architecture practices and added `.claude/skills/frontend-architecture` (SKILL, examples, references): done; see "Use the @/ alias in new imports despite existing ../../../ chains"
 
 - 2026-11-26 — M2 Skills client (Skills page 4 tabs, Agent Skills tab, SKILLS LAB nav, list-detail shell, Dropdown `disabled` items): 198 tests green; see "Per-query retry overrides on hooks"
+
+- 2026-11-26 — Conventions Extractor stage 1 client (/repos/:repoId/conventions page, card, edit + create modals, nav g c, formatRelative moved to lib/format): 233 tests green; see "A plain-object route in mockFetch cannot fail"
+
+- 2026-11-26 — Conventions Extractor stage 2 client (target SearchableSelect + MergeForm, MergeConflictsDialog → ConfigTab form, single-PATCH edit): 247 tests green; see "Merge conflicts travel to the Config tab through a never-fetched query"
+
+- 2026-11-26 — Conventions Extractor stage 3 client (AgentSuggestionsDialog after create / merge via ?suggest=1, after MergeConflictsDialog; useLinkAgentSkill; skill delete/rename invalidate conventions): 262 tests green; see "Invalidating the suggestions list after each link empties the open dialog"
+
+- 2026-11-27 — Skills safety UI + import tabs (card delete, rejected conventions hidden, SkillSafety banner/yellow highlight/Save gating, Add skill dialog Create · From file · Import from URL, agent suggestions act per row): client 299 green; see "jsdom has no Blob.text(): read files with FileReader"
 
 ## Open Questions
 

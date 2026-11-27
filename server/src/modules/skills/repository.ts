@@ -1,7 +1,10 @@
-import { and, asc, count, countDistinct, desc, eq, gte, inArray, sql, type SQL } from 'drizzle-orm';
-import type { Skill, SkillType, SkillUsage, SkillVersion } from '@devdigest/shared';
-import type { Db } from '../../db/client.js';
+import { and, asc, count, countDistinct, desc, eq, gte, inArray, isNull, notExists, sql, type SQL } from 'drizzle-orm';
+import { ConventionCategory } from '@devdigest/shared';
+import type { Skill, SkillSource, SkillType, SkillUsage, SkillVersion } from '@devdigest/shared';
+import type { DbExecutor, DbTx } from '../../db/client.js';
 import * as t from '../../db/schema.js';
+import { effectiveSkillSafety, isSkillFlagged, scanSkillBody } from '@devdigest/reviewer-core';
+import { SkillFlaggedError } from '../../platform/errors.js';
 import { ConflictError } from './errors.js';
 import {
   DONE_RUN_STATUS,
@@ -15,7 +18,9 @@ import {
   toSkillVersionDto,
   versionMessage,
   type AgentActivityCounts,
+  type SuggestionAgent,
 } from './helpers.js';
+import type { AgentSuggestionSignals } from './ports.js';
 
 /**
  * Skills data access. Owns `skills` + `skill_versions`; reads `agent_skills`,
@@ -27,8 +32,8 @@ import {
  * never leave this file.
  */
 
-type Tx = Parameters<Parameters<Db['transaction']>[0]>[0];
-type Executor = Db | Tx;
+type Tx = DbTx;
+type Executor = DbExecutor;
 
 export interface InsertSkill {
   name: string;
@@ -36,6 +41,10 @@ export interface InsertSkill {
   type: SkillType;
   body: string;
   enabled: boolean;
+  /** Provenance; `manual` unless another feature creates it (e.g. `extracted`). */
+  source?: SkillSource;
+  /** Repo files the skill was derived from (Conventions Extractor). */
+  evidenceFiles?: string[];
 }
 
 export interface UpdateSkill {
@@ -46,6 +55,13 @@ export interface UpdateSkill {
   enabled?: boolean;
   /** "What changed?" — used only when the body changes. */
   message?: string;
+  /** Replace `evidence_files` (Conventions Extractor merge). Internal, not in the API. */
+  evidenceFiles?: string[];
+  /**
+   * Optimistic check: the version the caller based its new body on. A
+   * different current version (someone saved meanwhile) → 409. Internal.
+   */
+  expectedVersion?: number;
 }
 
 /** Outcome of a restore: the service maps the failure kinds to 404 / 409. */
@@ -61,7 +77,8 @@ export interface SkillAgentRef extends SkillUsage {
 }
 
 export class SkillsRepository {
-  constructor(private readonly db: Db) {}
+  /** On a transaction handle every method joins it (own transactions become savepoints). */
+  constructor(private readonly db: Executor) {}
 
   /** Skills in the workspace, name asc, each with its agent count (one grouped query). */
   async list(workspaceId: string): Promise<Skill[]> {
@@ -73,10 +90,12 @@ export class SkillsRepository {
     return skill;
   }
 
-  /** Insert a manual skill at v1 and its `Initial version` snapshot, atomically. */
+  /** Insert a skill (manual by default) at v1 and its `Initial version` snapshot, atomically. */
   async insert(workspaceId: string, values: InsertSkill): Promise<Skill> {
     return this.mapConflict(() =>
       this.db.transaction(async (tx) => {
+        // A flagged body can be saved, but never enabled (it stays out of prompts).
+        const safety = scanSkillBody(values.body, new Date().toISOString());
         const [row] = await tx
           .insert(t.skills)
           .values({
@@ -84,9 +103,11 @@ export class SkillsRepository {
             name: values.name,
             description: values.description,
             type: values.type,
-            source: MANUAL_SOURCE,
+            source: values.source ?? MANUAL_SOURCE,
             body: values.body,
-            enabled: values.enabled,
+            enabled: values.enabled && !isSkillFlagged(safety),
+            evidenceFiles: values.evidenceFiles ?? null,
+            safety,
             version: INITIAL_SKILL_VERSION,
           })
           .returning();
@@ -111,9 +132,28 @@ export class SkillsRepository {
       this.db.transaction(async (tx) => {
         const existing = await this.lockSkill(tx, workspaceId, id);
         if (!existing) return undefined;
+        if (patch.expectedVersion !== undefined && existing.version !== patch.expectedVersion) {
+          throw new ConflictError('Skill changed while merging — try again');
+        }
 
         const bodyChanged = isBodyChange(existing.body, patch.body);
         const nextVersion = bodyChanged ? existing.version + 1 : existing.version;
+
+        // Re-scan on a body change; a legacy / outdated scan is refreshed too.
+        const at = new Date().toISOString();
+        const safety = bodyChanged
+          ? scanSkillBody(patch.body!, at)
+          : effectiveSkillSafety(existing.safety, existing.body, at);
+        const flagged = isSkillFlagged(safety);
+        // Turning a flagged skill on is refused; a save that makes it flagged
+        // still goes through, but the skill is switched off.
+        if (flagged && patch.enabled === true && !bodyChanged) {
+          throw new SkillFlaggedError(
+            `Skill "${existing.name}" is flagged as a possible prompt injection; fix its body before enabling it`,
+            { skill_id: id },
+          );
+        }
+        const enabled = flagged ? false : patch.enabled;
 
         await tx
           .update(t.skills)
@@ -121,8 +161,10 @@ export class SkillsRepository {
             ...(patch.name !== undefined ? { name: patch.name } : {}),
             ...(patch.description !== undefined ? { description: patch.description } : {}),
             ...(patch.type !== undefined ? { type: patch.type } : {}),
-            ...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
+            ...(enabled !== undefined ? { enabled } : {}),
+            ...(patch.evidenceFiles !== undefined ? { evidenceFiles: patch.evidenceFiles } : {}),
             ...(bodyChanged ? { body: patch.body!, version: nextVersion } : {}),
+            safety,
             updatedAt: sql`now()`,
           })
           .where(this.scope(workspaceId, id));
@@ -218,9 +260,17 @@ export class SkillsRepository {
       if (!source) return { kind: 'version_not_found' };
 
       const nextVersion = existing.version + 1;
+      // An old version can be flagged too: restoring it switches the skill off.
+      const safety = scanSkillBody(source.body, new Date().toISOString());
       await tx
         .update(t.skills)
-        .set({ body: source.body, version: nextVersion, updatedAt: sql`now()` })
+        .set({
+          body: source.body,
+          version: nextVersion,
+          safety,
+          ...(isSkillFlagged(safety) ? { enabled: false } : {}),
+          updatedAt: sql`now()`,
+        })
         .where(this.scope(workspaceId, skillId));
       await tx.insert(t.skillVersions).values({
         skillId,
@@ -312,5 +362,76 @@ export class SkillsRepository {
       if (isUniqueViolation(err)) throw new ConflictError('A skill with this name already exists');
       throw err;
     }
+  }
+}
+
+/**
+ * Read-only facts for agent suggestions (`AgentSuggestionSignals`, ports.ts).
+ * Reads `conventions` (categories of the non-rejected rules marked as in the skill),
+ * `agents`, `agent_skills` and `skills`; writes nothing.
+ */
+export class DrizzleAgentSuggestionSignals implements AgentSuggestionSignals {
+  constructor(private readonly db: Executor) {}
+
+  async skillCategories(workspaceId: string, skillId: string): Promise<ConventionCategory[]> {
+    const category = sql<string | null>`${t.conventions.details} ->> 'category'`;
+    const rows = await this.db
+      .selectDistinct({ category })
+      .from(t.conventions)
+      .where(
+        and(
+          eq(t.conventions.workspaceId, workspaceId),
+          // A rule rejected after it went into the skill no longer speaks for it.
+          isNull(t.conventions.rejectedAt),
+          sql`coalesce(${t.conventions.details} -> 'skill_ids', '[]'::jsonb) @> jsonb_build_array(${skillId}::text)`,
+        ),
+      );
+    // A legacy row without a category, or an unknown value, carries no signal.
+    return rows.flatMap((r) => {
+      const parsed = ConventionCategory.safeParse(r.category);
+      return parsed.success ? [parsed.data] : [];
+    });
+  }
+
+  async candidateAgents(workspaceId: string, skillId: string): Promise<SuggestionAgent[]> {
+    const agents = await this.db
+      .select({ id: t.agents.id, name: t.agents.name, description: t.agents.description })
+      .from(t.agents)
+      .where(
+        and(
+          eq(t.agents.workspaceId, workspaceId),
+          eq(t.agents.enabled, true),
+          notExists(
+            this.db
+              .select({ one: sql`1` })
+              .from(t.agentSkills)
+              .where(and(eq(t.agentSkills.agentId, t.agents.id), eq(t.agentSkills.skillId, skillId))),
+          ),
+        ),
+      )
+      .orderBy(asc(t.agents.name), asc(t.agents.id));
+    if (agents.length === 0) return [];
+
+    const typeRows = await this.db
+      .select({ agentId: t.agentSkills.agentId, type: t.skills.type, n: count() })
+      .from(t.agentSkills)
+      .innerJoin(t.skills, eq(t.agentSkills.skillId, t.skills.id))
+      .where(
+        and(
+          inArray(
+            t.agentSkills.agentId,
+            agents.map((a) => a.id),
+          ),
+          eq(t.skills.workspaceId, workspaceId),
+        ),
+      )
+      .groupBy(t.agentSkills.agentId, t.skills.type);
+    const types = new Map<string, Partial<Record<SkillType, number>>>();
+    for (const r of typeRows) {
+      const byType = types.get(r.agentId) ?? {};
+      byType[r.type] = r.n;
+      types.set(r.agentId, byType);
+    }
+    return agents.map((a) => ({ ...a, linkedSkillTypes: types.get(a.id) ?? {} }));
   }
 }

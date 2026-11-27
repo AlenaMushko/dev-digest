@@ -8,7 +8,7 @@ import type {
   LLMProvider,
 } from '@devdigest/shared';
 import type { AppConfig } from './config.js';
-import type { Db } from '../db/client.js';
+import type { Db, DbTx } from '../db/client.js';
 import { JobRunner } from './jobs.js';
 import { runBus, type RunBus } from './sse.js';
 import { LocalSecretsProvider } from '../adapters/secrets/local.js';
@@ -25,11 +25,14 @@ import { PriceBook } from './price-book.js';
 import { ConfigError } from './errors.js';
 import { AgentsRepository } from '../modules/agents/repository.js';
 import { ReviewRepository } from '../modules/reviews/repository.js';
+import { SkillsRepository } from '../modules/skills/repository.js';
 import type { RepoIntel } from '../modules/repo-intel/types.js';
 import { RepoIntelService } from '../modules/repo-intel/service.js';
 import { DepCruiseGraph } from '../adapters/depgraph/index.js';
 import { TiktokenTokenizer } from '../adapters/tokenizer/index.js';
 import type { DepGraph, Tokenizer } from '../modules/repo-intel/ports.js';
+import type { RemoteTextFetcher } from '../modules/skills/ports.js';
+import { SafeHttpTextFetcher } from '../adapters/http/safe-fetch.js';
 
 /**
  * DI container. One per app instance. Holds config, db, the JobRunner,
@@ -52,6 +55,8 @@ export interface ContainerOverrides {
   /** repo-intel T3 adapters — only the indexer pipeline reads these. */
   depgraph?: DepGraph;
   tokenizer?: Tokenizer;
+  /** "Import skill from URL" fetcher — tests inject a mock (no network). */
+  textFetcher?: RemoteTextFetcher;
 }
 
 export class Container {
@@ -73,10 +78,12 @@ export class Container {
   // `container.agentsRepo` instead of reaching into another module's folder.
   private _agentsRepo?: AgentsRepository;
   private _reviewRepo?: ReviewRepository;
+  private _skillsRepo?: SkillsRepository;
   private _repoIntel?: RepoIntel;
   private _depgraph?: DepGraph;
   private _tokenizer?: Tokenizer;
   private _priceBook?: PriceBook;
+  private _textFetcher?: RemoteTextFetcher;
 
   constructor(config: AppConfig, db: Db, private overrides: ContainerOverrides = {}) {
     this.config = config;
@@ -101,6 +108,23 @@ export class Container {
 
   get reviewRepo(): ReviewRepository {
     return (this._reviewRepo ??= new ReviewRepository(this.db));
+  }
+
+  /** Shared skills repository — the Conventions Extractor writes skills through it. */
+  get skillsRepo(): SkillsRepository {
+    return (this._skillsRepo ??= new SkillsRepository(this.db));
+  }
+
+  /** SSRF-safe fetcher of a remote skill file (Import from URL). */
+  get textFetcher(): RemoteTextFetcher {
+    if (this.overrides.textFetcher) return this.overrides.textFetcher;
+    this._textFetcher ??= new SafeHttpTextFetcher();
+    return this._textFetcher;
+  }
+
+  /** A skills repository bound to an open transaction (for a module's UnitOfWork). */
+  skillsRepoOn(tx: DbTx): SkillsRepository {
+    return new SkillsRepository(tx);
   }
 
   get codeIndex(): CodeIndex {

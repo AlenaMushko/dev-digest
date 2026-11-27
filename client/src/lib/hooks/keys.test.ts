@@ -17,11 +17,14 @@ describe("queryKeys", () => {
     expect(queryKeys.agents()).toEqual(["agents"]);
     expect(queryKeys.agent("a1")).toEqual(["agent", "a1"]);
     expect(queryKeys.agentSkills("a1")).toEqual(["agent-skills", "a1"]);
+    // conventionsAll is the prefix of every repo's conventions key.
+    expect(queryKeys.conventions("r1").slice(0, 1)).toEqual([...queryKeys.conventionsAll()]);
     expect(queryKeys.skills()).toEqual(["skills"]);
     expect(queryKeys.skill("s1")).toEqual(["skill", "s1"]);
     expect(queryKeys.skillUsage("s1")).toEqual(["skill-usage", "s1"]);
     expect(queryKeys.skillStats("s1")).toEqual(["skill-stats", "s1"]);
     expect(queryKeys.skillVersions("s1")).toEqual(["skill-versions", "s1"]);
+    expect(queryKeys.agentSuggestions("s1")).toEqual(["agent-suggestions", "s1"]);
     expect(queryKeys.prActiveRuns("p1")).toEqual(["pr-active-runs", "p1"]);
     expect(queryKeys.prRuns("p1")).toEqual(["pr-runs", "p1"]);
     expect(queryKeys.reviews("p1")).toEqual(["reviews", "p1"]);

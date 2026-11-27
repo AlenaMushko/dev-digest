@@ -22,6 +22,11 @@ actionable cold.
 
 ## What Works
 
+### 2026-11-27 — Read the `Skills:` run-log line before trusting a with-skills run
+**Insight:** `loadPromptSkills()` drops skills that are not linked or are disabled and gives no warning, so a run planned with 4 skills actually ran with 3 (`response-schema` was never ticked), and the order follows `agent_skills.order`, not creation order.
+**Rule:** ALWAYS check the trace's Live log line `Skills: name@vN, …` (from `skillsLogLine()`) against the intended list and order before comparing runs — because the UI shows no error for a missing skill.
+**Evidence:** `server/src/modules/reviews/repository/skill.repo.ts` → `loadPromptSkills()` | `reviews/helpers.ts` → `skillsLogLine()` | `GET /runs/:id/trace`
+
 ## What Doesn't Work
 
 ### 2026-11-25 — Persisting a review and its findings as two inserts
@@ -33,6 +38,21 @@ actionable cold.
 **Insight:** `server/tsconfig.json` compiles `src/**/*.ts` with no `rootDir`; a `src/**/*.test.ts` importing `test/helpers/pg.ts` shifts the inferred root so output lands in `dist/src/…` and `node dist/server.js` breaks.
 **Rule:** NEVER put tests that import from `server/test/` under `src/` — because it silently moves the build output; put them in `server/test/`.
 **Evidence:** `server/test/skills.it.test.ts`, `server/test/run-executor-skills.test.ts`
+
+### 2026-11-26 — Storing scan meta only on the rows a scan kept
+**Insight:** Conventions keep scan meta in each row's `details.scan`; a scan that keeps nothing writes no row, so answering with `latestScan(rows)` returned null (first scan → empty state again) or an older scan's time/SHA. The tech-lead review caught it; both tests had mocked a page that already had scan meta.
+**Rule:** ALWAYS return the scan's own meta object in the scan reply (`scan: scanMeta`) and test a FIRST scan with zero candidates — because derived meta lags whenever nothing is stored.
+**Evidence:** `server/src/modules/conventions/service.ts` → `scan()` | test `conventions.it.test.ts` "a FIRST scan that keeps nothing still answers with this scan's meta"
+
+### 2026-11-26 — Read-then-UPDATE of conventions.details loses a concurrent skill_ids mark
+**Insight:** `ConventionsService.update()` read the row, built a new `details` object and wrote it back; a `markInSkill` committed in between was overwritten, because the UPDATE only waits for the lock and then writes the stale object.
+**Rule:** ALWAYS change `details` via `ConventionsRepository.update(ws, id, makePatch)` (SELECT … FOR UPDATE, patch computed from the locked row) or a single jsonb statement like `markInSkill()` — because any whole-object write from an earlier read races with the badge mark.
+**Evidence:** `server/src/modules/conventions/repository.ts` → `update()`, `markInSkill()` | test `conventions.it.test.ts` "a PATCH racing a markInSkill keeps the new skill id"
+
+### 2026-11-27 — [REVIEW NEEDED] Skill rules copied into the agent system prompt hide the skills' effect
+**Insight:** an API Contract Reviewer whose system prompt already listed the rules ("changed HTTP method → CRITICAL", "nullable output → WARNING") found every planted break with `Skills: none`, so comparing runs with and without skills showed nothing; a role-only prompt went from 0 CRITICAL / score 70 (no skills) to 4 CRITICAL / score 0 (4 skills) on the same PR.
+**Rule:** ALWAYS keep an agent's system prompt role-only and put review rules in skills when you measure skill impact — because the prompt is sent on every run, so rules in it make the without-skills baseline already contain the skills.
+**Evidence:** `reviewer-core/src/prompt.ts` → `assemblePrompt()` (system + `## Skills / rules`) | experiment CookBook_fool#22, agent "API Contract Reviewer (lite)"
 
 ## Codebase Patterns
 
@@ -83,6 +103,67 @@ actionable cold.
 **Rule:** ALWAYS order links by `order, skill_id` and bump the agent version inside the relink transaction comparing (id, order) before/after — because ids alone miss order-only changes and a post-write re-read races.
 **Evidence:** `server/src/modules/agents/repository.ts` → `relink()` | `server/src/modules/reviews/repository/skill.repo.ts` | test `agents-skills.it.test.ts`
 
+### 2026-11-26 — Conventions state lives in accepted + rejected_at + details jsonb
+**Insight:** The user required minimal schema change, so migration 0012 only ADDs `conventions.details` (jsonb: evidence[] with lines, category, bad_example, scan meta, skill_ids) and `rejected_at`; there is no status column and no scans/convention_skills table. pending = `!accepted && rejected_at IS NULL`; the scan header and the "in skill" badge are derived from `details`.
+**Rule:** ALWAYS derive status via `deriveStatus()` and read/write `details` only through `ConventionsRepository` (Zod-parsed, tolerant) — because a new column or table was explicitly rejected and `evidence_path`/`evidence_snippet` must keep mirroring `details.evidence[0]` for older readers.
+**Evidence:** `server/src/modules/conventions/repository.ts` → `parseDetails()`, `detailColumns()`, `replacePending()` | `helpers.ts` → `deriveStatus()`, `latestScan()` | migration `0012_thick_blackheart.sql`
+
+### 2026-11-26 — Conventions scan has no unindexed fallback by decision
+**Insight:** Walking the clone when repo-intel has no rank would need `walkClone` from `repo-intel/pipeline` (forbidden: repo-intel is read only through its facade) or a new facade method; the user chose neither.
+**Rule:** NEVER add a clone-walk fallback to `ConventionsService.scan()` without asking — because the agreed behaviour is 422 "Repo is not indexed yet" when `getConventionSamples()` returns [].
+**Evidence:** `server/src/modules/conventions/service.ts` → `scan()` | test `conventions.it.test.ts` "422s when the repo is not cloned, then when it is not indexed"
+
+### 2026-11-26 — [REVIEW NEEDED] The conventions feature model defaults to an OpenAI model
+**Insight:** `FEATURE_MODELS.conventions` defaults to `openai / gpt-5.4`; a workspace with only an OpenRouter key (the local dev setup on 2026-11-26) fails every scan in `container.llm('openai')` until Settings → Feature Models → Conventions is switched to an OpenRouter model.
+**Rule:** ALWAYS check `/settings/secrets-status` and the `conventions` feature model before testing a live scan — because the failure is a config error, not a bug in the extractor.
+**Evidence:** `server/src/vendor/shared/contracts/platform.ts` → `FEATURE_MODELS` | `server/src/modules/conventions/routes.ts` → `model.resolve`
+> **Update 2026-11-26:** the user asked for no hard failure: conventions now resolve through `pickAvailableLLM()` (`settings/feature-models.ts`), falling back OpenRouter → OpenAI → Anthropic on a missing key; only when none has a key does the scan fail. Test `feature-model-fallback.test.ts`.
+
+### 2026-11-26 — Fall back across LLM providers on ConfigError only
+**Insight:** `container.llm(provider)` throws `ConfigError` (HTTP 500) when that provider's key is missing, and that is the only signal of "no key"; network/auth errors are different classes. A system feature can therefore try providers in order by catching just `ConfigError`.
+**Rule:** ALWAYS resolve a system feature's LLM via `pickAvailableLLM(resolveFeatureModel(...), p => container.llm(p))` and keep each provider's fallback model in `FALLBACK_FEATURE_MODELS` — because swallowing other errors would hide real outages, and a provider switch needs its own model id (an OpenAI id is not valid on OpenRouter).
+**Evidence:** `server/src/modules/settings/feature-models.ts` → `pickAvailableLLM()`, `FALLBACK_FEATURE_MODELS` | `server/src/platform/container.ts` → `buildLlm()` | test `feature-model-fallback.test.ts`
+
+### 2026-11-26 — Wrap repo content in non-review LLM prompts yourself
+**Insight:** `INJECTION_GUARD` is private to `reviewer-core/src/prompt.ts` (and must not be touched), so features outside the review engine get no guard unless they add one; only `wrapUntrusted` is re-exported via `platform/prompt.ts`. Skill bodies also reach the review prompt UNwrapped, so repo code inside them needs a fence longer than any backtick run.
+**Rule:** ALWAYS wrap repo content with `wrapUntrusted()` plus a feature-local guard (e.g. `EXTRACTION_INJECTION_GUARD`) and fence skill-body code with `codeFence()` — because sampled files include AGENTS.md/CONTRIBUTING.md and a stray ``` would turn code into reviewer instructions.
+**Evidence:** `server/src/modules/conventions/prompt.ts` → `EXTRACTION_INJECTION_GUARD`, `buildExtractionUserPrompt()` | `helpers.ts` → `codeFence()`, `ruleBlock()`
+
+### 2026-11-26 — Cross-module atomic writes: build tx-bound repositories through the container
+**Insight:** `SkillsRepository` and `ConventionsRepository` take a `DbExecutor` (`Db | DbTx` from `db/client.ts`); on a transaction handle their own `db.transaction()` calls become savepoints, so the conventions UnitOfWork can write skills + skill_versions + conventions.details atomically without importing the skills module.
+**Rule:** ALWAYS give a module UoW a factory from the composition root (`container.skillsRepoOn(tx)`) and construct repositories on the `tx` — because importing another module's repository breaks onion §3 and `db.transaction` in a service breaks §8.
+**Evidence:** `server/src/modules/conventions/repository.ts` → `DrizzleConventionsUnitOfWork` | `platform/container.ts` → `skillsRepoOn()` | test `conventions.it.test.ts` "UnitOfWork: a failure after the skill insert rolls back the skill and the mark"
+
+### 2026-11-26 — Merge into a skill guards the slow LLM call with expectedVersion
+**Insight:** The `ConventionMergeCheck` call runs outside the transaction (seconds), so `SkillsRepository.update` got an internal `expectedVersion`: under the row lock a different version throws 409 "Skill changed while merging"; `evidenceFiles` is also internal-only (the Zod `UpdateSkillInput` strips both from the public PUT).
+**Rule:** ALWAYS pass `expectedVersion: skill.version` (read before the model call) when writing a body computed from an earlier read — because otherwise a human edit saved during the call is silently overwritten.
+**Evidence:** `server/src/modules/conventions/service.ts` → `mergeIntoSkill()` | `skills/repository.ts` → `update()` | test `conventions.it.test.ts` "merge: 404 … 409 when the skill changed meanwhile"
+
+### 2026-11-26 — Agent suggestions score in skills/helpers; CATEGORY_KEYWORDS overlap ordinary words
+**Insight:** `GET /skills/:id/agent-suggestions` is code-only: `rankAgentSuggestions()` mixes category (0.4), type (0.3), keywords (0.3; 0/0.3/0.7 when the skill has no category) with values from `skills/constants.ts`; categories come from `conventions.details.category` where `skill_ids` contains the skill, read via the `AgentSuggestionSignals` port. Category words like `handling`, `type`, `name`, `design` are common in descriptions, so an agent can score a category hit and a keyword hit from one word.
+**Rule:** ALWAYS compute test expectations against `CATEGORY_KEYWORDS` and `SUGGESTION_STOP_WORDS` (trailing -s/-es stripped, fenced code ignored) and change weights only in `constants.ts` — because two of my first expected scores were wrong on exactly this overlap, and the user fixed the keyword lists in plan decision F16.
+**Evidence:** `server/src/modules/skills/helpers.ts` → `scoreAgentForSkill()`, `rankAgentSuggestions()` | `repository.ts` → `DrizzleAgentSuggestionSignals` | tests `skills-helpers.test.ts` "rankAgentSuggestions…", `skills.it.test.ts` "GET /skills/:id/agent-suggestions…"
+
+### 2026-11-26 — The markdown fence rule lives in two modules; keep them in step
+**Insight:** `conventions/helpers.ts` `markdownSections()` and `skills/helpers.ts` `stripCodeFences()` both scan fences line by line (close = same char, at least as long, no info string); a regex version (`^\1$`, lazy) ate the text between two blocks when the closing fence was longer. Skills keeps its own copy because importing the conventions module from skills breaks onion module boundaries.
+**Rule:** ALWAYS change both scanners together (skills also accepts any indent and treats an unclosed fence as running to the end) and NEVER go back to a regex — because fences with different lengths or list indentation silently leak code into suggestion keywords or mis-split sections.
+**Evidence:** `server/src/modules/skills/helpers.ts` → `stripCodeFences()` | `conventions/helpers.ts` → `markdownSections()` | test `skills-helpers.test.ts` "a longer closing fence closes; text between two blocks survives"
+
+### 2026-11-27 — Skill import exists only as disabled menu items
+**Insight:** "Import from file / URL / Community" on the Skills page are disabled "soon" items, and no server route imports a skill; `SkillSource` includes `imported_url` but nothing writes it, so every UI- or API-created skill is `source: manual` (or `extracted` from conventions).
+**Rule:** NEVER plan a task step that relies on importing a skill — because there is no import path; create the skill via `POST /skills` (Create from scratch), or build the import feature first.
+**Evidence:** `client/src/app/skills/_components/AddSkillMenu/constants.ts` → `IMPORT_ITEMS` | `server/src/vendor/shared/contracts/knowledge.ts` → `SkillSource` | `server/src/modules/skills/routes.ts`
+
+### 2026-11-27 — Do the SSRF IP check inside the https socket lookup
+**Insight:** Validating a URL's resolved IP and then calling `fetch` resolves DNS twice, so a rebinding host can pass the check and connect to 169.254.169.254; `SafeHttpTextFetcher` passes its own `lookup` to `node:https.request`, so the address that is checked is the address that is connected, and every redirect hop goes through `assertImportableUrl()` again.
+**Rule:** ALWAYS route user-supplied outbound URLs through `container.textFetcher` (or the same lookup-hook pattern) — because a pre-flight `dns.lookup` + global `fetch` leaves a TOCTOU gap and follows redirects unchecked.
+**Evidence:** `server/src/adapters/http/safe-fetch.ts` → `publicOnlyLookup`, `isPrivateAddress()`, `SafeHttpTextFetcher.fetchText()` | test `skills-import.test.ts` "safe-fetch — SSRF rules"
+
+### 2026-11-27 — The skill injection scanner lives in reviewer-core
+**Insight:** skills (write + enable gate), agents (link gate) and reviews (`loadPromptSkills` filter) all need `scanSkillBody()`; a module-local copy would force a cross-module import, so it sits in `reviewer-core/src/skill-safety.ts` and is exported through its `index.ts`. A flagged write switches the skill off in `SkillsRepository` (under the row lock), so conventions create/merge get the same rule.
+**Rule:** ALWAYS bump `SKILL_SCANNER_VERSION` when a rule changes — because `effectiveSkillSafety()` trusts a stored `skills.safety` only for the current version and rescans older ones on read.
+**Evidence:** `reviewer-core/src/skill-safety.ts` → `scanSkillBody()`, `effectiveSkillSafety()` | `server/src/modules/skills/repository.ts` → `insert()`, `update()`, `restore()` | `agents/service.ts` → `assertNotFlagged()`
+
 ## Tool & Library Notes
 
 ### 2026-11-25 — Keep dependency-cruiser rule regexes flat and unanchored for pnpm
@@ -105,6 +186,11 @@ actionable cold.
 **Rule:** ALWAYS keep the it-test asserting `PUT {}` leaves fields untouched when upgrading zod — because patch semantics depend on this zod 3 behaviour.
 **Evidence:** `server/src/vendor/shared/contracts/knowledge.ts` → `UpdateSkillInput` | test `skills.it.test.ts`
 
+### 2026-11-27 — A new value in a Drizzle text enum needs no migration
+**Insight:** `skills.source` is `text('source', { enum: [...] })`: the enum is TypeScript-only, there is no CHECK constraint, so adding `imported_file` made `pnpm db:generate` print "No schema changes"; only the Zod `SkillSource` contracts (both copies) gate the value.
+**Rule:** ALWAYS add a new source / type value to the schema enum AND both `vendor/shared` contracts, and do not expect a migration — because the DB accepts any text and only the contract rejects unknown values.
+**Evidence:** `server/src/db/schema/skills.ts` → `source` | `vendor/shared/contracts/knowledge.ts` → `SkillSource` | `pnpm db:generate`
+
 ## Recurring Errors & Fixes
 
 ## Session Notes
@@ -116,6 +202,16 @@ actionable cold.
 - 2026-11-26 — M2 Skills spec + plan written (docs/specs/m2-skills), no code; see "Skill plumbing exists end to end except the run executor"
 
 - 2026-11-26 — M2 Skills server (migration 0011, skills module + stats, agent link checks, executor skills, seed): 262 tests green; see "Sort agent_skills by order then skill_id"
+
+- 2026-11-26 — Conventions Extractor stage 1 server (migration 0012, conventions module scan/triage/draft/create, skills insert source+evidence_files, container.skillsRepo): 290 tests green; see "Conventions state lives in accepted + rejected_at + details jsonb"
+
+- 2026-11-26 — Conventions Extractor stage 2 server (UoW, locked details update, merge into existing skill with code dedupe + ConventionMergeCheck + 409 on stale version): 318 tests green; see "Cross-module atomic writes: build tx-bound repositories through the container"
+
+- 2026-11-26 — Conventions Extractor stage 3 server (GET /skills/:id/agent-suggestions, read-only port, code-only scoring): 333 tests green; see "Agent suggestions score in skills/helpers; CATEGORY_KEYWORDS overlap ordinary words"
+
+- 2026-11-27 — Final phase (API Contract Reviewer experiment on CookBook_fool#22, pr-self-review PASS, PR description): done; see "Skill rules copied into the agent system prompt hide the skills' effect"
+
+- 2026-11-27 — Skills safety + import (migration 0013 `skills.safety`, rule scanner in reviewer-core, 422 skill_flagged on enable/link, POST /skills/scan, SSRF-safe POST /skills/import-url, source imported_file/url stored disabled): server 399 green; see "Do the SSRF IP check inside the https socket lookup"
 
 ## Open Questions
 
